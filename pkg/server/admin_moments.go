@@ -35,7 +35,7 @@ func (s *Server) apiMoments(w http.ResponseWriter, r *http.Request, a adminSessi
 		authorID = u.ID
 	}
 	from := storage.MomentCursor{At: queryInt(q.Get("cursor_at")), ID: q.Get("cursor_id")}
-	page, err := s.st.AllMoments(authorID, from, 30)
+	page, err := s.st.AllMoments(authorID, from, pageLimit(r, 30, 100))
 	if err != nil {
 		s.writeStorageErr(w, err)
 		return

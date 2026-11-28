@@ -187,6 +187,19 @@ func TestAudit(t *testing.T) {
 	if len(all) != 25 || all[0].At != 25 || all[24].At != 1 {
 		t.Fatalf("after reopen: %d entries", len(all))
 	}
+	for _, target := range []string{"first", "second"} {
+		if err := st.AppendAudit(AuditEntry{At: 30, ActorID: "a", Action: "view", Target: target}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first, err := st.ListAudit(AuditFilter{Limit: 1})
+	if err != nil || len(first) != 1 || first[0].Target != "second" {
+		t.Fatalf("first page with matching times: %+v, %v", first, err)
+	}
+	second, err := st.ListAudit(AuditFilter{Before: first[0].At, BeforeID: first[0].ID, Limit: 1})
+	if err != nil || len(second) != 1 || second[0].At != 30 || second[0].Target != "first" {
+		t.Fatalf("paging skipped an entry with the same time: %+v, %v", second, err)
+	}
 }
 
 // 1.4: counts match what was written; ListConversations includes DMs.
@@ -251,6 +264,18 @@ func TestSearchMessages(t *testing.T) {
 	if ids(r.Messages) != "3" {
 		t.Fatalf("case-insensitive: %s", ids(r.Messages))
 	}
+	r, err := st.SearchMessages(SearchFilter{Keywords: []string{"发布", "DONE"}}, SearchCursor{})
+	if err != nil || ids(r.Messages) != "5" {
+		t.Fatalf("mixed short and indexed keywords: %s, %v", ids(r.Messages), err)
+	}
+	r, err = st.SearchMessages(SearchFilter{Keywords: []string{"release", "NOTES"}}, SearchCursor{})
+	if err != nil || ids(r.Messages) != "3" {
+		t.Fatalf("multiple indexed keywords: %s, %v", ids(r.Messages), err)
+	}
+	r, err = st.SearchMessages(SearchFilter{Keywords: []string{"发布", "delayed"}, AuthorID: "alice"}, SearchCursor{})
+	if err != nil || len(r.Messages) != 0 {
+		t.Fatalf("deleted message matched a filtered search: %s, %v", ids(r.Messages), err)
+	}
 	r, _ = st.SearchMessages(SearchFilter{AuthorID: "alice", From: 150}, SearchCursor{})
 	if ids(r.Messages) != "3" {
 		t.Fatalf("author and time: %s", ids(r.Messages))
@@ -289,6 +314,11 @@ func TestSearchKeywordWildcardsAreLiteral(t *testing.T) {
 		if err != nil || len(r.Messages) != 1 || r.Messages[0].ID != want {
 			t.Errorf("keyword %q: %+v %v, want %s", kw, r.Messages, err, want)
 		}
+	}
+	st.AppendMessage(Message{ID: "quoted", ConversationID: "c", AuthorID: "u", Body: `the "ok" token`, CreatedAt: 10})
+	r, err := st.SearchMessages(SearchFilter{Keywords: []string{`"ok"`, "token"}}, SearchCursor{})
+	if err != nil || len(r.Messages) != 1 || r.Messages[0].ID != "quoted" {
+		t.Fatalf("quotes in a literal keyword: %+v %v", r.Messages, err)
 	}
 }
 

@@ -489,6 +489,15 @@ func TestAdminSearchContinues(t *testing.T) {
 			t.Fatalf("%s returned %d times", body, n)
 		}
 	}
+	status, multi := root.get("/admin/api/search?keyword=HIT&keyword=3")
+	if status != http.StatusOK {
+		t.Fatalf("multi-keyword search: %d %+v", status, multi)
+	}
+	hits, keywords := multi["messages"].([]any), multi["keywords"].([]any)
+	if len(hits) != 1 || hits[0].(map[string]any)["body"] != "hit 3" ||
+		len(keywords) != 2 || keywords[0] != "HIT" || keywords[1] != "3" {
+		t.Fatalf("multi-keyword search did not provide hits and highlight terms: %+v", multi)
+	}
 }
 
 // Viewing conversations, including other people's private chats, and every
@@ -888,4 +897,14 @@ func TestAdminUsersPageFiltersBeforePaging(t *testing.T) {
 	}
 	assertPage("/admin/api/users?q=ann&limit=1", "anna", "anna")
 	assertPage("/admin/api/users?q=ann&limit=1&after=anna", "anne", "")
+	for _, endpoint := range []string{"users", "accounts"} {
+		status, page := root.get("/admin/api/" + endpoint + "?q=ann&limit=1&page=100")
+		if status != http.StatusOK || page["page"] != float64(2) || page["last"] != float64(2) {
+			t.Fatalf("indexed %s did not clamp to its last filtered page: %d %+v", endpoint, status, page)
+		}
+		users := page["users"].([]any)
+		if len(users) != 1 || users[0].(map[string]any)["username"] != "anne" {
+			t.Fatalf("indexed %s spoiled the last page: %+v", endpoint, users)
+		}
+	}
 }

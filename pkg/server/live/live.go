@@ -307,7 +307,11 @@ func Run(ctx context.Context, screen tcell.Screen, src Source, logs *LogSink, op
 			dirty = true
 		case now := <-frames.C:
 			if !transition.stopping.IsZero() {
-				if transition.drawShutdown(screen, &d, now, src.ShutdownPhase()) {
+				display := &d
+				if paused != nil {
+					display = paused
+				}
+				if transition.drawShutdown(screen, display, now, src.ShutdownPhase()) {
 					return nil
 				}
 				continue

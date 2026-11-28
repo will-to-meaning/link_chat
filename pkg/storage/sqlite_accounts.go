@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"context"
 	"database/sql"
 	"sort"
 )
@@ -61,6 +62,24 @@ func (s *sqlStore) ListUsersPage(search, after string, limit int) ([]User, strin
 		return users, "", err
 	}
 	return users[:limit], users[limit-1].UsernameKey, nil
+}
+
+func (s *sqlStore) ListUserDirectory(ctx context.Context, search string, page int64, limit int) ([]User, int64, int64, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, 0, 0, mapErr(err)
+	}
+	defer tx.Rollback()
+	const predicate = ` WHERE instr(username_key, ?) > 0`
+	var count int64
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM users`+predicate, search).Scan(&count); err != nil {
+		return nil, 0, 0, mapErr(err)
+	}
+	last := max(1, (count+int64(limit)-1)/int64(limit))
+	page = min(last, max(1, page))
+	users, err := collectUsers(tx.QueryContext(ctx, `SELECT `+userCols+` FROM users`+predicate+
+		` ORDER BY username_key LIMIT ? OFFSET ?`, search, limit, (page-1)*int64(limit)))
+	return users, page, last, err
 }
 
 func collectUsers(rows *sql.Rows, err error) ([]User, error) {
@@ -296,6 +315,60 @@ func (s *sqlStore) ListConversations() ([]Conversation, error) {
 		list = append(list, c)
 	}
 	return list, mapErr(rows.Err())
+}
+
+// ListAdminConversations uses indexed lookups for the latest message and only
+// counts memberships for the requested page.
+const adminConversationLabel = `CASE WHEN c.kind = 'dm' THEN COALESCE((
+	SELECT group_concat(name, ' ↔ ') FROM (
+		SELECT COALESCE(u.username, peer.value) AS name
+		FROM json_each(CASE WHEN json_valid(c.member_ids) THEN c.member_ids ELSE '[]' END) peer
+		LEFT JOIN users u ON u.id = peer.value ORDER BY peer.key
+	)
+), '') ELSE '#' || c.name END`
+
+func (s *sqlStore) CountAdminConversations(ctx context.Context, search string) (int64, error) {
+	var count int64
+	err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM conversations c
+		WHERE ? = '' OR instr(lower(`+adminConversationLabel+`), lower(?)) > 0`, search, search).Scan(&count)
+	return count, mapErr(err)
+}
+
+func (s *sqlStore) ListAdminConversations(ctx context.Context, search string, after AdminConversationCursor, limit int, offset int64) ([]AdminConversationSummary, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		WITH catalog AS (
+			SELECT c.id, c.kind, c.topic, c.created_by, c.created_at, c.member_ids,
+			       `+adminConversationLabel+` AS label,
+			       COALESCE(m.created_at, 0) AS last_at, COALESCE(m.seq, 0) AS message_count
+			FROM conversations c LEFT JOIN messages m ON m.pk = (
+				SELECT pk FROM messages WHERE conversation_id = c.id ORDER BY seq DESC LIMIT 1
+			)
+		), page AS MATERIALIZED (
+			SELECT * FROM catalog
+			WHERE (?1 = '' OR instr(lower(label), lower(?1)) > 0)
+			  AND (?2 = '' OR (-last_at, label, id) > (-?3, ?4, ?2))
+			ORDER BY last_at DESC, label, id LIMIT ?5 OFFSET ?6
+		)
+		SELECT p.id, p.kind, p.label, p.topic, COALESCE(u.username, p.created_by), p.created_at,
+		       p.last_at, p.message_count,
+		       CASE WHEN p.kind = 'dm' THEN json_array_length(CASE WHEN json_valid(p.member_ids) THEN p.member_ids ELSE '[]' END)
+		            ELSE (SELECT count(*) FROM members WHERE conversation_id = p.id) END
+		FROM page p LEFT JOIN users u ON u.id = p.created_by
+		ORDER BY p.last_at DESC, p.label, p.id`, search, after.ID, after.LastAt, after.Label, limit, offset)
+	if err != nil {
+		return nil, mapErr(err)
+	}
+	defer rows.Close()
+	out := []AdminConversationSummary{}
+	for rows.Next() {
+		var item AdminConversationSummary
+		if err := rows.Scan(&item.ID, &item.Kind, &item.Label, &item.Topic, &item.CreatedBy, &item.CreatedAt,
+			&item.LastAt, &item.MessageCount, &item.Members); err != nil {
+			return nil, mapErr(err)
+		}
+		out = append(out, item)
+	}
+	return out, mapErr(rows.Err())
 }
 
 // ConversationCatalog returns the visible conversations, membership information

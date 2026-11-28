@@ -54,12 +54,12 @@ func TestLiveActivityVisibility(t *testing.T) {
 	alice.callOK(protocol.OpMessageSend, protocol.SendMessageReq{ConversationID: channel.ID, Body: body}, nil)
 
 	full := awaitLiveStream(t, fullStream, "message")
-	if full.Content != body || full.Channel == nil || full.Channel.Name != name || full.MessageBand != 2 {
+	if full.Content != body || full.Channel == nil || full.Channel.Name != name || full.MessageBand != 2 || full.Series != "channel_message" {
 		t.Fatalf("full activity: %+v", full)
 	}
 	redacted := awaitLiveStream(t, statsStream, "message")
 	if redacted.Content != "" || redacted.MessageBand != 0 || redacted.Channel == nil || redacted.Channel.Name != "" ||
-		redacted.Channel.ID != channel.ID || strings.Contains(redacted.Summary, name) {
+		redacted.Channel.ID != channel.ID || strings.Contains(redacted.Summary, name) || redacted.Series != full.Series {
 		t.Fatalf("stats-only activity: %+v", redacted)
 	}
 	localMessage := awaitLocalActivity(t, local, "message")
@@ -171,6 +171,23 @@ func TestLiveStatsAcceptsCustomTrendMinutes(t *testing.T) {
 	data := result["activity_trend"].(map[string]any)
 	if data["minutes"] != float64(23) || data["bucket_seconds"] != float64(1) || len(data["series"].([]any)) != 17 || len(data["samples"].([]any)) != 23*60 {
 		t.Fatalf("unexpected custom trend metadata: %+v", data)
+	}
+}
+
+func TestLiveStatsCountsRecentlyActiveChannels(t *testing.T) {
+	_, srv, admin, _ := adminFixture(t)
+	channel := func(id string) *LiveChannel { return &LiveChannel{ID: id} }
+	srv.publishActivity(Activity{Kind: "message", Category: ActivityMessage, Channel: channel("recent")}, "")
+	srv.publishActivity(Activity{Kind: "message", Category: ActivityMessage, Channel: channel("recent")}, "")
+	srv.publishActivity(Activity{Kind: "message", Category: ActivityMessage, Channel: channel("removed")}, "")
+	srv.publishActivity(Activity{Kind: "channel.deleted", Category: ActivitySystem, Channel: channel("removed")}, "")
+	srv.live.mu.Lock()
+	srv.live.channelActive["expired"] = time.Now().Add(-3 * time.Minute).UnixMilli()
+	srv.live.mu.Unlock()
+
+	status, result := admin.get("/admin/api/live/stats")
+	if status != http.StatusOK || result["active_channels"] != float64(1) {
+		t.Fatalf("expected one active channel after deduplication, expiry and deletion: %d %v", status, result)
 	}
 }
 

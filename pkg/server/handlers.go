@@ -1111,6 +1111,10 @@ func (s *Server) toProtocolMessage(m storage.Message) protocol.Message {
 		pu := publicUser(u, prof, false)
 		avatar, color = pu.Avatar, pu.Color
 	}
+	return messageWithAuthor(m, name, avatar, color)
+}
+
+func messageWithAuthor(m storage.Message, name, avatar, color string) protocol.Message {
 	return protocol.Message{
 		ID:             m.ID,
 		ConversationID: m.ConversationID,

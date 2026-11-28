@@ -37,6 +37,7 @@ type Activity struct {
 	At          int64            `json:"at"`
 	Kind        string           `json:"kind"`
 	Category    ActivityCategory `json:"category"`
+	Series      string           `json:"series"`
 	Actor       ActivityUser     `json:"actor"`
 	Target      *ActivityUser    `json:"target,omitempty"`
 	Channel     *LiveChannel     `json:"channel,omitempty"`
@@ -68,6 +69,7 @@ type LiveStats struct {
 	StartedAt      int64                `json:"started_at"`
 	MessagesToday  int64                `json:"messages_today"`
 	MessagesMinute int64                `json:"messages_minute"`
+	ActiveChannels int                  `json:"active_channels"`
 	Trend          []LiveActivityBucket `json:"trend"`
 	ActivityTrend  LiveTrend            `json:"activity_trend"`
 }
@@ -130,8 +132,11 @@ type activityState struct {
 	onlineSince   map[string]int64
 	viewed        map[string]channelView
 	focusSequence uint64
+	channelActive map[string]int64
 	trend         [maxLiveTrendMinutes * liveTrendBuckets]liveTrendSlot
 }
+
+const liveChannelActivityWindow = 2 * time.Minute
 
 // SubscribeActivity registers a local, content-free subscription for the
 // lifetime of ctx. Subscribe before reading the snapshot to avoid a gap.
@@ -176,6 +181,7 @@ func (s *Server) activity(kind string, category ActivityCategory, actorID, targe
 
 func (s *Server) publishActivity(a Activity, content string) {
 	a.Summary = activitySummary(a)
+	a.Series = liveTrendSeries[trendSeriesFor(a)].ID
 	public := a
 	if a.Kind == "message" && content != "" {
 		a.MessageBand = messageLengthBand(content)
@@ -190,6 +196,16 @@ func (s *Server) publishActivity(a Activity, content string) {
 	s.live.sequence++
 	a.At, a.Sequence = storage.Now(), s.live.sequence
 	s.live.countTrend(a)
+	if a.Channel != nil {
+		if a.Kind == "channel.deleted" {
+			delete(s.live.channelActive, a.Channel.ID)
+		} else {
+			if s.live.channelActive == nil {
+				s.live.channelActive = make(map[string]int64)
+			}
+			s.live.channelActive[a.Channel.ID] = a.At
+		}
+	}
 	public.At, public.Sequence = a.At, a.Sequence
 	if s.live.recent == nil {
 		s.live.recent = make(map[string]recentActivity)
@@ -362,8 +378,17 @@ func (s *Server) liveStats(minutes int, since int64) (LiveStats, error) {
 	midnight := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
 	today, minute, err := s.st.LiveMessageCounts(midnight.UnixMilli(), now.Add(-time.Minute).UnixMilli())
 	coarse, detail := s.live.liveTrend(now.UnixMilli(), minutes, since)
+	activeAfter := now.Add(-liveChannelActivityWindow).UnixMilli()
+	s.live.mu.Lock()
+	for id, at := range s.live.channelActive {
+		if at <= activeAfter {
+			delete(s.live.channelActive, id)
+		}
+	}
+	activeChannels := len(s.live.channelActive)
+	s.live.mu.Unlock()
 	return LiveStats{Version: version.String(), StartedAt: s.startedAt.UnixMilli(),
-		MessagesToday: today, MessagesMinute: minute, Trend: coarse, ActivityTrend: detail}, err
+		MessagesToday: today, MessagesMinute: minute, ActiveChannels: activeChannels, Trend: coarse, ActivityTrend: detail}, err
 }
 
 // LiveSnapshot returns the initial state for the local dashboard.

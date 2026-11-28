@@ -3,6 +3,7 @@ package live
 import (
 	"fmt"
 	"math"
+	"math/rand/v2"
 	"strings"
 	"time"
 
@@ -17,17 +18,20 @@ import (
 )
 
 const (
-	crtDuration     = 480 * time.Millisecond
-	moduleDuration  = 720 * time.Millisecond
-	completionPause = 280 * time.Millisecond
-	blackPause      = 65 * time.Millisecond
-	progressSpeed   = 220 // percentage points per second
+	crtDuration           = 480 * time.Millisecond
+	moduleDuration        = 720 * time.Millisecond
+	shutdownBackgroundEnd = 1420 * time.Millisecond
+	shutdownSweep         = 1550 * time.Millisecond
+	completionPause       = 130 * time.Millisecond
+	shutdownCRT           = 250 * time.Millisecond
+	blackPause            = 65 * time.Millisecond
 )
 
 type dashboardTransition struct {
 	started, stopping, finished time.Time
-	progressFrame, curtainAt    time.Time
-	progress                    float64
+	curtainAt                   time.Time
+	progress                    int
+	background                  shutdownFrame
 }
 
 func fraction(elapsed, duration time.Duration) float64 {
@@ -49,40 +53,187 @@ func (t *dashboardTransition) drawStartup(screen tcell.Screen, d *dashboard, now
 
 // drawShutdown returns true after the final black frame has been held.
 func (t *dashboardTransition) drawShutdown(screen tcell.Screen, d *dashboard, now time.Time, phase server.ShutdownPhase) bool {
-	openAtStop := fraction(t.stopping.Sub(t.started)-crtDuration, moduleDuration)
-	open := openAtStop - fraction(now.Sub(t.stopping), moduleDuration)
-	if open > 0 && !d.still {
-		d.drawModules(screen, now, open)
-		return false
-	}
+	elapsed := max(0, now.Sub(t.stopping))
 	if !t.curtainAt.IsZero() && !now.Before(t.curtainAt) {
 		if d.still {
 			return true
 		}
-		elapsed := now.Sub(t.curtainAt)
-		drawCRT(screen, 1-fraction(elapsed, crtDuration))
-		return elapsed >= crtDuration+blackPause
+		out := now.Sub(t.curtainAt)
+		drawCRT(screen, 1-fraction(out, shutdownCRT))
+		return out >= shutdownCRT+blackPause
 	}
 
-	l := d.lang
-	target, detail := shutdownCheckpoint(phase, l)
-	if !t.finished.IsZero() {
-		target, detail = 100, tr(l, "通信与存储已关闭", "Connections and storage are closed")
+	screen.Clear()
+	if !d.still && elapsed < shutdownBackgroundEnd {
+		w, h := screen.Size()
+		if t.background.width != w || t.background.height != h || !t.background.captured {
+			t.background.capture(screen, d, t.stopping)
+			screen.Clear()
+		}
+		t.background.draw(screen, elapsed)
+	}
+
+	done := !t.finished.IsZero()
+	target, detail := shutdownCheckpoint(phase, d.lang)
+	if done {
+		target, detail = 100, tr(d.lang, "通信与存储已关闭", "Connections and storage are closed")
 		if phase == server.ShutdownGraceExpired {
-			detail = tr(l, "连接等待超时，存储已关闭", "Connection drain timed out. Storage is closed.")
+			detail = tr(d.lang, "连接等待超时，存储已关闭", "Connection drain timed out. Storage is closed.")
 		}
 	}
-	if t.progressFrame.IsZero() {
-		t.progressFrame = now
+	// The sweep sets the presentation speed; the server still controls which
+	// checkpoint may be shown, including the final 100 percent.
+	clock := fraction(elapsed, shutdownSweep)
+	visual := int(100 * (.64*clock + .36*anim.EaseOutCubic(clock)))
+	if d.still {
+		visual = target
 	}
-	delta := max(0, now.Sub(t.progressFrame).Seconds())
-	t.progress = min(float64(target), t.progress+delta*progressSpeed)
-	t.progressFrame = now
-	if t.progress >= 100 && t.curtainAt.IsZero() {
+	t.progress = min(target, max(t.progress, visual))
+	if t.progress == 100 && t.curtainAt.IsZero() {
 		t.curtainAt = now.Add(completionPause)
 	}
-	drawShutdownProgress(screen, int(t.progress), detail, now.Sub(t.stopping), l)
+
+	drawShutdownProgress(screen, t.progress, detail, elapsed, !d.still, d.lang)
+	screen.Show()
 	return false
+}
+
+type shutdownFrame struct {
+	width, height int
+	captured      bool
+	units         []shutdownUnit
+}
+
+type shutdownCell struct {
+	x, y, width int
+	glyph       string
+	style       tcell.Style
+}
+
+type shutdownUnit struct {
+	cells []shutdownCell
+	until time.Duration
+}
+
+type shutdownPane struct {
+	items  [][]shutdownCell
+	header []shutdownCell
+	weight int
+}
+
+func shutdownRow(screen tcell.Screen, left, right, y int) []shutdownCell {
+	var cells []shutdownCell
+	for x := left; x < right; {
+		glyph, style, width := screen.Get(x, y)
+		width = max(1, width)
+		if glyph != "" && (glyph != " " || style != tcell.StyleDefault) {
+			cells = append(cells, shutdownCell{x, y, width, glyph, style})
+		}
+		x += width
+	}
+	return cells
+}
+
+func shutdownRows(screen tcell.Screen, left, right, top, bottom, weight int) shutdownPane {
+	pane := shutdownPane{weight: weight}
+	if top >= bottom || left >= right {
+		return pane
+	}
+	pane.header = shutdownRow(screen, left, right, top)
+	for y := top + 1; y < bottom; y++ {
+		if row := shutdownRow(screen, left, right, y); len(row) > 0 {
+			pane.items = append(pane.items, row)
+		}
+	}
+	return pane
+}
+
+func (frame *shutdownFrame) capture(screen tcell.Screen, d *dashboard, stoppedAt time.Time) {
+	frame.width, frame.height = screen.Size()
+	frame.captured = true
+	frame.units = frame.units[:0]
+
+	// Exclude in-flight message traces when recording the settled layout.
+	display := *d
+	display.links = nil
+	display.paint(screen, stoppedAt)
+	w, h := frame.width, frame.height
+	var panes []shutdownPane
+	if d.page != noDetails || d.systemExpanded || h < 6 {
+		panes = append(panes, shutdownRows(screen, 0, w, 0, h, 1))
+	} else {
+		divider, split := dashboardBody(w, h)
+		users := shutdownPane{header: shutdownRow(screen, 0, split, 2), weight: 4}
+		for y := 3; y < divider; y++ {
+			row := shutdownRow(screen, 0, split, y)
+			// Usernames are separated by column gaps. A whole name or the
+			// remaining-users caption stays together as a single unit.
+			start := 0
+			for i := 1; i < len(row); i++ {
+				previous := row[i-1]
+				if row[i].x-previous.x-previous.width >= 2 {
+					users.items = append(users.items, row[start:i])
+					start = i
+				}
+			}
+			if start < len(row) {
+				users.items = append(users.items, row[start:])
+			}
+		}
+		rng := rand.New(rand.NewPCG(uint64(stoppedAt.UnixNano()), 0))
+		rng.Shuffle(len(users.items), func(i, j int) { users.items[i], users.items[j] = users.items[j], users.items[i] })
+		panes = append(panes, users)
+
+		if split < w {
+			channels := shutdownPane{header: shutdownRow(screen, split, w, 2), weight: 2}
+			for y := 3; y < divider; y++ {
+				channels.header = append(channels.header, shutdownRow(screen, split, split+1, y)...)
+			}
+			for y := 3; y < divider; y += 3 {
+				var box []shutdownCell
+				for row := y; row < min(y+3, divider); row++ {
+					box = append(box, shutdownRow(screen, split+1, w, row)...)
+				}
+				if len(box) > 0 {
+					channels.items = append(channels.items, box)
+				}
+			}
+			panes = append(panes, channels)
+		}
+		for i := range server.ActivityCategories() {
+			left, right := panelBounds(w, i)
+			panes = append(panes, shutdownRows(screen, left, right, divider+1, h, 1))
+		}
+		bands := shutdownPane{weight: 1}
+		bands.items = append(bands.items, shutdownRow(screen, 0, w, divider), shutdownRow(screen, 0, w, 1))
+		bands.header = shutdownRow(screen, 0, w, 0)
+		panes = append(panes, bands)
+	}
+
+	totalWeight := 0
+	for _, pane := range panes {
+		totalWeight += pane.weight
+	}
+	var start time.Duration
+	for _, pane := range panes {
+		duration := shutdownBackgroundEnd * time.Duration(pane.weight) / time.Duration(totalWeight)
+		for i, cells := range pane.items {
+			until := start + duration*time.Duration(i+1)/time.Duration(len(pane.items)+1)
+			frame.units = append(frame.units, shutdownUnit{cells, until})
+		}
+		start += duration
+		frame.units = append(frame.units, shutdownUnit{pane.header, start})
+	}
+}
+
+func (frame shutdownFrame) draw(screen tcell.Screen, elapsed time.Duration) {
+	for _, unit := range frame.units {
+		if elapsed < unit.until {
+			for _, cell := range unit.cells {
+				screen.Put(cell.x, cell.y, cell.glyph, cell.style)
+			}
+		}
+	}
 }
 
 func shutdownCheckpoint(phase server.ShutdownPhase, lang i18n.Lang) (int, string) {
@@ -102,41 +253,59 @@ func shutdownCheckpoint(phase server.ShutdownPhase, lang i18n.Lang) (int, string
 	}
 }
 
-func drawShutdownProgress(screen tcell.Screen, percent int, detail string, elapsed time.Duration, lang i18n.Lang) {
-	screen.Clear()
+func drawShutdownProgress(screen tcell.Screen, percent int, detail string, elapsed time.Duration, moving bool, lang i18n.Lang) {
 	w, h := screen.Size()
+	if w < 1 || h < 1 {
+		return
+	}
 	middle := h / 2
 	title := fmt.Sprintf(tr(lang, "正在关停  %d%%", "Shutting down  %d%%"), percent)
 	if percent == 100 {
 		title = tr(lang, "关停完成  100%", "Shutdown complete  100%")
 	}
-	if h < 5 || w < 8 {
-		centerText(screen, w, max(0, middle-1), title, accent.Bold(true))
+	if h < 7 || w < 16 {
+		centerText(screen, 0, w, max(0, middle-1), title, accent.Bold(true))
 		if h >= 2 {
-			centerText(screen, w, middle, detail, bright)
+			centerText(screen, 0, w, middle, detail, bright)
 		}
-		screen.Show()
 		return
 	}
-	centerText(screen, w, middle-2, title, accent.Bold(true))
-	barWidth := min(44, w-4)
+
+	background := tcell.NewHexColor(0x101923)
+	withCard := func(style tcell.Style) tcell.Style {
+		return style.Background(background)
+	}
+	cardWidth := min(58, w-4)
+	cardX := (w - cardWidth) / 2
+	card := withCard(tcell.StyleDefault)
+	for y := middle - 3; y <= middle+3; y++ {
+		screen.PutStrStyled(cardX, y, strings.Repeat(" ", cardWidth), card)
+	}
+	centerText(screen, cardX, cardWidth, middle-2, title, withCard(accent.Bold(true)))
+	barWidth := cardWidth - 8
 	barX := (w - barWidth) / 2
-	drawRule(screen, barX, middle, barWidth, muted)
+	track := withCard(tcell.StyleDefault.Foreground(tcell.NewHexColor(0x415469)))
+	drawRule(screen, barX, middle, barWidth, track)
 	filled := barWidth * percent / 100
 	if filled > 0 {
-		drawRule(screen, barX, middle, filled-1, accent.Bold(true))
-		drawRule(screen, barX+filled-1, middle, 1, bright.Bold(true))
+		drawRule(screen, barX, middle, filled-1, withCard(accent.Bold(true)))
+		drawRule(screen, barX+filled-1, middle, 1, withCard(bright.Bold(true)))
 	}
-	centerText(screen, w, middle+1, detail, bright)
-	if middle+2 < h && percent < 100 {
-		centerText(screen, w, middle+2, fmt.Sprintf(tr(lang, "已用时 %.1f 秒", "Elapsed %.1f s"), elapsed.Seconds()), muted)
+	if moving && elapsed >= shutdownSweep && percent < 100 && filled < barWidth {
+		// A low-contrast pulse indicates a live wait on the unfilled track.
+		remaining := barWidth - filled
+		head := int(elapsed/(65*time.Millisecond)) % remaining
+		drawRule(screen, barX+filled+head, middle, 1, withCard(muted))
 	}
-	screen.Show()
+	centerText(screen, cardX, cardWidth, middle+1, detail, withCard(bright))
+	if percent < 100 {
+		centerText(screen, cardX, cardWidth, middle+2, fmt.Sprintf(tr(lang, "已用时 %.1f 秒", "Elapsed %.1f s"), elapsed.Seconds()), withCard(muted))
+	}
 }
 
-func centerText(screen tcell.Screen, width, y int, text string, style tcell.Style) {
+func centerText(screen tcell.Screen, x, width, y int, text string, style tcell.Style) {
 	text = runewidth.Truncate(text, width, "")
-	screen.PutStrStyled(max(0, (width-uniseg.StringWidth(text))/2), y, text, style)
+	screen.PutStrStyled(x+max(0, (width-uniseg.StringWidth(text))/2), y, text, style)
 }
 
 // drawCRT uses one openness value in both directions. At the center the two

@@ -311,7 +311,7 @@ func TestShutdownWaitsForTeardownBeforeShowingCompletion(t *testing.T) {
 	transition := dashboardTransition{started: now.Add(-time.Minute), stopping: now}
 	d := dashboard{}
 
-	progressStart := now.Add(moduleDuration)
+	progressStart := now.Add(shutdownSweep)
 	transition.drawShutdown(screen, &d, progressStart, server.ShutdownDraining)
 	waiting := progressStart.Add(10 * time.Second)
 	if end := transition.drawShutdown(screen, &d, waiting, server.ShutdownDraining); end ||
@@ -326,10 +326,75 @@ func TestShutdownWaitsForTeardownBeforeShowingCompletion(t *testing.T) {
 	closing := transition.finished.Add(completionPause)
 	if end := transition.drawShutdown(screen, &d, closing, server.ShutdownGraceExpired); end ||
 		strings.Contains(screenText(screen), "100%") {
-		t.Fatalf("CRT phase should take over after completion: %s", screenText(screen))
+		t.Fatalf("the completion panel should be cleared after its hold: %s", screenText(screen))
 	}
-	if end := transition.drawShutdown(screen, &d, closing.Add(crtDuration+blackPause), server.ShutdownGraceExpired); !end ||
+	w, h := screen.Size()
+	top, _, _, _ := screen.GetContent(w/2, 0)
+	bottom, _, _, _ := screen.GetContent(w/2, h-1)
+	if top != '─' || bottom != '─' {
+		t.Fatalf("shutdown should start its last phase with two edge lines: %q, %q", top, bottom)
+	}
+	transition.drawShutdown(screen, &d, closing.Add(shutdownCRT/2), server.ShutdownGraceExpired)
+	var lines []int
+	for y := range h {
+		if r, _, _, _ := screen.GetContent(w/2, y); r == '─' {
+			lines = append(lines, y)
+		}
+	}
+	if len(lines) != 2 || lines[0] <= 0 || lines[0]+lines[1] != h-1 {
+		t.Fatalf("shutdown lines should converge symmetrically: %v", lines)
+	}
+	if end := transition.drawShutdown(screen, &d, closing.Add(shutdownCRT+blackPause), server.ShutdownGraceExpired); !end ||
 		strings.TrimSpace(screenText(screen)) != "" {
 		t.Fatalf("terminal should end on a black frame: %s", screenText(screen))
+	}
+}
+
+func TestShutdownClosesWholeUnitsOnePaneAtATime(t *testing.T) {
+	screen := simulationScreen(t, 120, 32)
+	now := time.Unix(1700000042, 0)
+	d := dashboard{users: make(map[string]server.LiveUser), channels: map[string]channelBox{"one": {"alpha", now}}}
+	names := []string{"user-aa", "user-bb", "user-cc", "user-dd", "user-ee", "user-ff"}
+	for _, name := range names {
+		d.users[name] = server.LiveUser{ActivityUser: server.ActivityUser{ID: name, Name: name}}
+	}
+	timeline := dashboardTransition{started: now.Add(-time.Minute), stopping: now, finished: now}
+	timeline.drawShutdown(screen, &d, now, server.ShutdownDrained)
+	if text := screenText(screen); !strings.Contains(text, "正在关停") || !strings.Contains(text, "user-aa") {
+		t.Fatalf("the dashboard and progress should share the initial frame: %s", screenText(screen))
+	}
+	units := timeline.background.units
+	var order []string
+	for _, unit := range units[:len(names)] {
+		var name strings.Builder
+		for _, cell := range unit.cells {
+			name.WriteString(cell.glyph)
+		}
+		order = append(order, name.String())
+	}
+	if strings.Join(order, ",") == strings.Join(names, ",") {
+		t.Fatalf("users should be shuffled, got %v", order)
+	}
+	timeline.drawShutdown(screen, &d, now.Add(units[0].until), server.ShutdownDrained)
+	for _, cell := range units[0].cells {
+		if got, _, _ := screen.Get(cell.x, cell.y); got != " " {
+			t.Fatalf("first username should disappear as a whole, cell %q remains", got)
+		}
+	}
+	for _, cell := range units[1].cells {
+		if got, style, _ := screen.Get(cell.x, cell.y); got != cell.glyph || style != cell.style {
+			t.Fatalf("surviving username changed: got %q instead of %q", got, cell.glyph)
+		}
+	}
+	timeline.drawShutdown(screen, &d, now.Add(units[len(names)].until), server.ShutdownDrained)
+	if text := screenText(screen); strings.Contains(text, "user-") || !strings.Contains(text, "#alpha") {
+		t.Fatalf("the user pane should close before the channel pane: %s", text)
+	}
+	timeline.drawShutdown(screen, &d, now.Add(shutdownSweep), server.ShutdownDrained)
+	if text := screenText(screen); strings.Contains(text, "实况") || !strings.Contains(text, "关停完成  100%") {
+		t.Fatalf("only completed progress should remain: %s", text)
+	}
+	if !timeline.drawShutdown(screen, &d, now.Add(2*time.Second), server.ShutdownDrained) {
+		t.Fatal("fast shutdown animation should finish within two seconds")
 	}
 }

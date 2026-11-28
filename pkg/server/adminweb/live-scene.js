@@ -203,7 +203,7 @@ export class LiveScene {
     this.departingChannels.add(node);
   }
 
-  sync(users, channels) {
+  sync(users, channels, showChannelFocus) {
     for (const [id, node] of this.channels) {
       if (!channels.has(id)) {
         this.removeNode(node);
@@ -248,7 +248,7 @@ export class LiveScene {
       const angle = i * GOLDEN_ANGLE + 2;
       const radius = 2.5 + rank * 8.5;
       node.home.set(Math.cos(angle) * radius, Math.sin(angle) * radius * 0.66, 4 - rank * 7);
-      node.viewing = user.online ? user.viewing_channel : "";
+      node.viewing = showChannelFocus && user.online ? user.viewing_channel : "";
       node.online = user.online;
       node.energy = 1 - rank * 0.42;
       node.size = Math.max(0.13, (user.online ? 0.47 : 0.30) * Math.min(1, 18 / Math.sqrt(ranked.length)));

@@ -18,6 +18,96 @@ function create(tag, className, text = "") {
   return node;
 }
 
+function seriesChoices(container, series, selected, toggle) {
+  return new Map(series.map(({ id, label }, index) => {
+    const input = create("input", "");
+    input.type = "checkbox";
+    input.checked = selected(id);
+    input.onchange = () => toggle(id, input.checked);
+    const field = create("label", "", label);
+    field.style.setProperty("--series-color", activityColors[index % activityColors.length]);
+    field.prepend(input);
+    container.append(field);
+    return [id, input];
+  }));
+}
+
+function anchoredPopup(button, panel, id) {
+  button.type = "button";
+  button.setAttribute("aria-expanded", "false");
+  button.setAttribute("popovertarget", id);
+  panel.id = id;
+  panel.setAttribute("popover", "auto");
+  panel.classList.add("live-anchored-popup");
+  function position() {
+    if (!panel.matches(":popover-open")) return;
+    const anchor = button.getBoundingClientRect();
+    const left = Math.max(8, Math.min(anchor.left, innerWidth - panel.offsetWidth - 8));
+    const below = innerHeight - anchor.bottom;
+    const above = below < panel.offsetHeight + 12 && anchor.top > below;
+    const top = Math.max(8, Math.min(above ? anchor.top - panel.offsetHeight - 6 : anchor.bottom + 6, innerHeight - panel.offsetHeight - 8));
+    panel.style.left = left + "px";
+    panel.style.top = top + "px";
+    panel.style.transformOrigin = above ? "left bottom" : "left top";
+  }
+  const listeners = new AbortController();
+  panel.addEventListener("beforetoggle", (event) => {
+    if (event.newState === "open") queueMicrotask(position);
+  });
+  panel.addEventListener("toggle", () => {
+    const open = panel.matches(":popover-open");
+    button.setAttribute("aria-expanded", String(open));
+    if (open) position();
+  });
+  const options = { signal: listeners.signal };
+  window.addEventListener("resize", position, options);
+  window.addEventListener("scroll", position, { ...options, capture: true });
+  return () => listeners.abort();
+}
+
+function sceneActivityFilter(initial, onChange) {
+  const filter = create("div", "live-scene-filter");
+  const summary = create("button", "secondary", "活动筛选 · 全部");
+  const panel = create("div", "live-scene-options");
+  const checklist = create("div", "live-trend-checklist");
+  const actions = create("div", "live-filter-actions");
+  const all = create("button", "secondary", "全选");
+  const none = create("button", "secondary", "清空");
+  for (const button of [all, none]) { button.type = "button"; button.disabled = true; }
+  actions.append(all, none);
+  panel.append(actions, checklist);
+  filter.append(summary, panel);
+  const dispose = anchoredPopup(summary, panel, "live-scene-filter-popup");
+  let selected = initial ? new Set(initial) : null;
+  let checks;
+  const allows = (id) => !selected || selected.has(id);
+  function update() {
+    for (const [id, input] of checks) input.checked = allows(id);
+    summary.textContent = `活动筛选 · ${selected ? `${selected.size}/${checks.size}` : "全部"}`;
+    onChange(selected ? [...selected] : null);
+  }
+  all.onclick = () => { selected = null; update(); };
+  none.onclick = () => { selected = new Set(); update(); };
+  return {
+    filter, allows, dispose,
+    setSeries(series) {
+      if (!series?.length || checks) return;
+      checks = seriesChoices(checklist, series, allows, (id, checked) => {
+        selected ??= new Set(checks.keys());
+        if (checked) selected.add(id);
+        else selected.delete(id);
+        if (selected.size === checks.size) selected = null;
+        update();
+      });
+      all.disabled = none.disabled = false;
+      if (selected) {
+        selected = new Set([...selected].filter((id) => checks.has(id)));
+        summary.textContent = `活动筛选 · ${selected.size}/${checks.size}`;
+      }
+    },
+  };
+}
+
 function drawActivityChart(canvas, trend, series, hover) {
   const width = canvas.clientWidth, height = canvas.clientHeight;
   if (!width || !height) return;
@@ -85,8 +175,8 @@ function drawActivityChart(canvas, trend, series, hover) {
 function activityChart(onRangeChange) {
   const chart = create("section", "live-chart");
   const title = create("h3", "", "活动曲线");
-  const filters = create("details", "live-trend-filters");
-  const filterSummary = create("summary", "", "分类");
+  const filters = create("div", "live-trend-filters");
+  const filterSummary = create("button", "secondary", "分类");
   const filterPanel = create("div", "live-trend-options");
   const checklist = create("div", "live-trend-checklist");
   const presets = create("div", "live-trend-presets");
@@ -129,6 +219,7 @@ function activityChart(onRangeChange) {
   }
   filterPanel.append(checklist);
   filters.append(filterSummary, filterPanel);
+  const dispose = anchoredPopup(filterSummary, filterPanel, "live-chart-filter-popup");
   const head = create("div", "live-chart-head");
   head.append(title, filters, minutesLabel);
   const rangeTools = create("div", "live-trend-range");
@@ -165,7 +256,7 @@ function activityChart(onRangeChange) {
     onRangeChange();
   }
 
-  const checks = new Map();
+  let checks = new Map();
   function syncLegend() {
     const enabled = selectedSeries();
     filterSummary.textContent = `分类 ${enabled.length}`;
@@ -197,21 +288,11 @@ function activityChart(onRangeChange) {
     }
     data = next;
     if (!checks.size) {
-      for (const [index, item] of data.series.entries()) {
-        const field = create("label", "", item.label);
-        const input = create("input", "");
-        input.type = "checkbox";
-        input.checked = selected.has(item.id);
-        input.onchange = () => {
-          if (input.checked) selected.add(item.id);
-          else selected.delete(item.id);
-          applySelection();
-        };
-        field.style.setProperty("--series-color", activityColors[index % activityColors.length]);
-        field.prepend(input);
-        checklist.append(field);
-        checks.set(item.id, input);
-      }
+      checks = seriesChoices(checklist, data.series, (id) => selected.has(id), (id, checked) => {
+        if (checked) selected.add(id);
+        else selected.delete(id);
+        applySelection();
+      });
     }
     if (hover !== null && hover >= data.samples.length) hover = null;
     showSample();
@@ -237,16 +318,11 @@ function activityChart(onRangeChange) {
   };
   canvas.onpointerleave = () => { hover = null; showSample(); draw(); };
   syncPreset();
-  return { chart, canvas, draw, setData, minutes: () => minutes, ready: () => !!data,
+  return { chart, canvas, draw, setData, dispose, minutes: () => minutes, ready: () => !!data,
     since: () => data?.samples.at(-1)?.at ?? 0 };
 }
 
-function renderLimit(label, key, initial, apply) {
-  const input = create("input", "");
-  input.type = "number";
-  input.min = "0";
-  input.max = String(maxSceneLimit);
-  input.step = "1";
+function renderLimit(wheel, label, key, initial, apply) {
   let value = initial;
   try {
     const saved = localStorage.getItem(key);
@@ -255,7 +331,7 @@ function renderLimit(label, key, initial, apply) {
       if (Number.isInteger(n) && n >= 0 && n <= maxSceneLimit) value = n;
     }
   } catch { /* The current view still works when browser storage is disabled. */ }
-  input.value = String(value);
+  const { input, element } = wheel(label, value, maxSceneLimit, "", 0);
   input.addEventListener("input", () => {
     if (!Number.isFinite(input.valueAsNumber)) return;
     const next = Math.min(maxSceneLimit, Math.max(0, Math.trunc(input.valueAsNumber)));
@@ -264,22 +340,24 @@ function renderLimit(label, key, initial, apply) {
     apply(value);
     try { localStorage.setItem(key, String(value)); } catch { /* session-only */ }
   });
-  input.addEventListener("change", () => { input.value = String(value); });
-  const field = create("label", "", label);
-  field.append(input);
+  const field = create("div", "live-limit", label);
+  field.append(element);
   return { field, value };
 }
 
-export function mountLive(view, api) {
+export function mountLive(view, api, prefs) {
   view.classList.add("live-view");
   const main = create("section", "live-space");
   main.setAttribute("aria-label", "实时用户星体与频道星环");
   const stage = create("div", "live-stage");
   const overlay = create("div", "live-overlay");
+  const sceneViewport = create("div", "live-viewport");
   const head = create("div", "live-space-head");
-  const status = create("div", "live-status");
-  status.setAttribute("role", "status");
-  head.append(create("h2", "", "实况"), status);
+  head.append(create("h2", "", "实况"));
+  const snapshotError = create("p", "live-data-error");
+  snapshotError.setAttribute("role", "status");
+  snapshotError.hidden = true;
+  head.append(snapshotError);
   const legend = create("ul", "live-legend");
   for (const [text, type] of [["在线", "online"], ["离线", "offline"], ["频道", "channel"]]) {
     const item = create("li", "");
@@ -296,21 +374,30 @@ export function mountLive(view, api) {
   const hud = create("header", "live-hud");
   const stats = create("dl", "live-stats");
   const values = new Map();
-  for (const [key, caption] of [["online", "在线用户"], ["channels", "频道"], ["today", "今日消息"],
-    ["minute", "近一分钟消息"], ["social", "近一分钟社交"], ["uptime", "运行时长"]]) {
+  for (const [key, caption] of [["online", "在线用户"], ["active", "活跃频道"], ["activity", "近一分钟活动"],
+    ["channels", "频道总数"], ["today", "今日消息"], ["minute", "近一分钟消息"], ["uptime", "运行时长"]]) {
     const group = create("div");
+    if (key === "active") group.title = "最近两分钟有活动的频道";
     const value = create("dd", "", "—");
     values.set(key, value);
     group.append(create("dt", "", caption), value);
     stats.append(group);
   }
   const feed = create("details", "live-feed");
-  feed.open = true;
+  feed.open = prefs.feedOpen ?? true;
   const events = create("ol", "live-events");
   const empty = create("p", "live-empty", "等待活动…");
   feed.append(create("summary", "", "活动日志"), empty, events);
   const controls = create("details", "live-controls");
+  controls.open = prefs.controlsOpen ?? true;
   const trendChart = activityChart(() => loadStats());
+  const sceneFilter = sceneActivityFilter(prefs.sceneSeries, (selected) => {
+    prefs.sceneSeries = selected;
+    animations = [];
+    channelDepartures.clear();
+    scene?.clearEffects();
+    syncScene();
+  });
   const selection = create("section", "live-selection");
   const playerSelect = create("select", "");
   const channelSelect = create("select", "");
@@ -324,22 +411,24 @@ export function mountLive(view, api) {
   details.hidden = true;
   selection.append(search, playerSelect, channelSelect, details);
   const limits = create("fieldset", "live-limits");
-  const usersControl = renderLimit("用户上限", "link-chat-live-user-limit", defaultUsersLimit, (value) => {
+  const usersControl = renderLimit(api.integerWheel, "用户上限", "link-chat-live-user-limit", defaultUsersLimit, (value) => {
     usersLimit = value;
     syncScene();
   });
-  const channelsControl = renderLimit("频道上限", "link-chat-live-channel-limit", defaultChannelsLimit, (value) => {
+  const channelsControl = renderLimit(api.integerWheel, "频道上限", "link-chat-live-channel-limit", defaultChannelsLimit, (value) => {
     channelsLimit = value;
     channelRefillAt = 0;
     syncScene();
   });
   let usersLimit = usersControl.value, channelsLimit = channelsControl.value;
-  limits.append(create("legend", "", "3D 显示上限"), usersControl.field, channelsControl.field);
-  controls.append(create("summary", "", "场景控制"), limits, selection);
+  limits.setAttribute("aria-label", "3D 显示上限");
+  limits.append(usersControl.field, channelsControl.field);
+  controls.append(create("summary", "", "场景控制"), limits, sceneFilter.filter, selection);
   const dock = create("aside", "live-dock");
   dock.append(controls, trendChart.chart, feed);
   hud.append(head, stats);
-  main.append(stage, overlay, hud, dock, legend, fallback);
+  sceneViewport.append(stage, overlay, legend, fallback);
+  main.append(hud, sceneViewport, dock);
   view.replaceChildren(main);
 
   let scene;
@@ -375,16 +464,12 @@ export function mountLive(view, api) {
   let channelRefillTimer;
   let channelRefillAt = 0;
   let snapshotTimer;
-  let selected = null;
+  let selected = prefs.selected ?? null;
   let friendIDs = [];
   let friendRequest = 0;
   let animations = [];
   let logs = [];
-  const displaySize = typeof ResizeObserver === "function" ? new ResizeObserver(() => {
-    main.style.setProperty("--live-stage-top", `${Math.ceil(hud.offsetTop + hud.offsetHeight + 8)}px`);
-    trendChart.draw();
-  }) : null;
-  displaySize?.observe(hud);
+  const displaySize = typeof ResizeObserver === "function" ? new ResizeObserver(trendChart.draw) : null;
   displaySize?.observe(trendChart.canvas);
 
   playerSelect.onchange = () => choose("user", playerSelect.value);
@@ -493,15 +578,11 @@ export function mountLive(view, api) {
     }
   }
 
-  function setStatus(text, online = false) {
-    status.textContent = text;
-    status.classList.toggle("connected", online);
-  }
-
   function drawStats() {
     values.get("online").textContent = `${onlineCount} / ${users.size}`;
     values.get("channels").textContent = String(channels.size);
     if (statsData) {
+      values.get("active").textContent = String(statsData.active_channels ?? "—");
       values.get("today").textContent = String(statsData.messages_today);
       values.get("minute").textContent = String(statsData.messages_minute);
       if (statsData.started_at) {
@@ -514,11 +595,13 @@ export function mountLive(view, api) {
 
   function applyStats(next) {
     statsData = next;
+    api.markUpdated();
     if (next?.trend) {
-      values.get("social").textContent = String(next.trend.reduce((sum, bucket) => sum + bucket.counts[1], 0));
+      values.get("activity").textContent = String(next.trend.reduce((sum, bucket) => sum + bucket.counts.reduce((a, b) => a + b, 0), 0));
     }
     drawStats();
     trendChart.setData(next?.activity_trend);
+    sceneFilter.setSeries(next?.activity_trend?.series);
   }
 
   function syncScene() {
@@ -597,7 +680,7 @@ export function mountLive(view, api) {
     channelDepartures.clear();
     const departingUsers = animations.filter((a) => a.kind === "account.deleted" && scene?.users.has(a.actor.id));
     for (const activity of departingUsers.slice(-8)) scene?.departUser(activity.actor.id);
-    scene?.sync(visibleUsers, visibleChannels);
+    scene?.sync(visibleUsers, visibleChannels, sceneFilter.allows("channel_switch"));
     displayedChannels = new Map(visibleChannels);
     drawSelection(visibleUsers, visibleChannels);
     drawStats();
@@ -694,7 +777,8 @@ export function mountLive(view, api) {
   }
 
   function receive(a) {
-    if (a.kind === "channel.deleted" && a.channel && displayedChannels.has(a.channel.id)) {
+    const show = sceneFilter.allows(a.series);
+    if (show && a.kind === "channel.deleted" && a.channel && displayedChannels.has(a.channel.id)) {
       channelDepartures.set(a.channel.id, a.channel.name);
     }
     if (a.sequence > sequence) {
@@ -707,9 +791,9 @@ export function mountLive(view, api) {
       }
       if (a.kind.startsWith("friend.") && [a.actor.id, a.target?.id].includes(selected?.id)) refreshFriends();
     }
-    if (a.kind === "message" && scene?.hasMessageEndpoints(a)) {
+    if (show && a.kind === "message" && scene?.hasMessageEndpoints(a)) {
       scene.enqueue(a);
-    } else {
+    } else if (show) {
       if (animations.length === 200) animations.shift();
       animations.push(a);
     }
@@ -767,6 +851,7 @@ export function mountLive(view, api) {
         ...ch, label: ch.name ? "#" + ch.name : `频道 ${i + 1}`,
         members: ch.members ?? [], member_count: ch.member_count ?? 0, online_count: ch.online_count ?? 0,
       }]));
+      if (selected && !(selected.kind === "user" ? users : channels).has(selected.id)) selected = null;
       membership = new Map();
       for (const ch of channels.values()) for (const uid of ch.members) addMembership(uid, ch.id);
       recentUsers = new Map(snap.users.slice().sort((a, b) => (b.last_sequence ?? 0) - (a.last_sequence ?? 0))
@@ -783,10 +868,11 @@ export function mountLive(view, api) {
       refreshFriends();
       drawStats();
       syncScene();
-      setStatus(connected ? "实时连接" : "连接中", connected);
+      snapshotError.hidden = true;
     } catch (error) {
       if (!closed && generation === request) {
-        setStatus(api.errText(error));
+        snapshotError.textContent = api.errText(error);
+        snapshotError.hidden = false;
         buffered = [];
         bufferOverflow = false;
       }
@@ -828,7 +914,6 @@ export function mountLive(view, api) {
         syncScene();
         events.replaceChildren();
         empty.hidden = false;
-        setStatus("重新连接中");
         break;
       case "activity":
       case "channel.focus":
@@ -844,12 +929,16 @@ export function mountLive(view, api) {
         break;
     }
   });
-  setStatus("正在连接…");
   loadSnapshot();
   const statsInterval = setInterval(loadStats, 1000);
 
   return () => {
     closed = true;
+    sceneFilter.dispose();
+    trendChart.dispose();
+    prefs.controlsOpen = controls.open;
+    prefs.feedOpen = feed.open;
+    prefs.selected = selected;
     displaySize?.disconnect();
     clearInterval(statsInterval);
     clearTimeout(snapshotTimer);

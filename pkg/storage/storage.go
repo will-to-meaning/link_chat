@@ -131,6 +131,7 @@ func (s Sanction) ActiveAt(now int64) bool {
 // storage interface offers no way to change or remove an entry
 // (spec account-moderation / 审计日志).
 type AuditEntry struct {
+	ID        int64             `json:"id,omitempty"`
 	At        int64             `json:"at"`
 	ActorID   string            `json:"actor_id"`
 	ActorName string            `json:"actor_name"`
@@ -142,12 +143,13 @@ type AuditEntry struct {
 // AuditFilter narrows ListAudit. Zero fields do not filter. Before pages
 // backwards: only entries strictly older than it are returned.
 type AuditFilter struct {
-	ActorID string
-	Action  string
-	From    int64
-	To      int64
-	Before  int64
-	Limit   int
+	ActorID  string
+	Action   string
+	From     int64
+	To       int64
+	Before   int64
+	BeforeID int64
+	Limit    int
 }
 
 // Counts summarises the store for the admin overview.
@@ -162,6 +164,7 @@ type Counts struct {
 // filter; Keyword matches case-insensitively as a substring of the body.
 type SearchFilter struct {
 	Keyword        string
+	Keywords       []string // Every literal term must occur in the same message.
 	AuthorID       string
 	ConversationID string
 	From           int64
@@ -210,6 +213,19 @@ type ConversationSummary struct {
 	LastMessage   string
 }
 
+type AdminConversationSummary struct {
+	ID, Kind, Label, Topic, CreatedBy string
+	CreatedAt, LastAt, MessageCount   int64
+	Members                           int
+}
+
+// AdminConversationCursor is the complete ordering key for a directory page.
+type AdminConversationCursor struct {
+	LastAt int64  `json:"at"`
+	Label  string `json:"label"`
+	ID     string `json:"id"`
+}
+
 // Member records that a user belongs to a channel.
 type Member struct {
 	ConversationID string `json:"conversation_id"`
@@ -247,6 +263,7 @@ type Storage interface {
 	UserByID(id string) (User, error)
 	ListUsers() ([]User, error)
 	ListUsersPage(search, after string, limit int) ([]User, string, error)
+	ListUserDirectory(ctx context.Context, search string, page int64, limit int) (users []User, position, last int64, err error)
 	UpdateUserPasswordHash(userID, hash string) error
 	// UpdateUserCredentials updates both the password hash and the recovery
 	// material in one write, so a password reset cannot leave a half-updated
@@ -281,6 +298,8 @@ type Storage interface {
 	ConversationByID(id string) (Conversation, error)
 	ChannelByNameKey(key string) (Conversation, error)
 	ListConversations() ([]Conversation, error)
+	ListAdminConversations(context.Context, string, AdminConversationCursor, int, int64) ([]AdminConversationSummary, error)
+	CountAdminConversations(context.Context, string) (int64, error)
 	ConversationCatalog(userID string) ([]ConversationSummary, error)
 	DeleteConversation(id string) error
 	// DMBetween returns the direct message conversation shared by two users.
@@ -344,6 +363,7 @@ type Storage interface {
 	// SearchMessages returns at most min(f.Limit, SearchMaxResults) matches,
 	// newest first across all conversations.
 	SearchMessages(f SearchFilter, from SearchCursor) (SearchResult, error)
+	SearchMessagesContext(ctx context.Context, f SearchFilter, from SearchCursor) (SearchResult, error)
 
 	// Friends, profiles and moments (see social.go).
 	Social

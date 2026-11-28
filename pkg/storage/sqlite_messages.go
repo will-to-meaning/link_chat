@@ -1,10 +1,12 @@
 package storage
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"strings"
+	"unicode/utf8"
 )
 
 // ---------- messages ----------
@@ -215,9 +217,7 @@ func (s *sqlStore) Counts() (Counts, error) {
 	return c, mapErr(err)
 }
 
-// likePattern builds a substring LIKE pattern for kw and reports whether it
-// needs an ESCAPE clause. Plain keywords skip ESCAPE so the trigram index can
-// serve the LIKE.
+// likePattern builds a literal substring pattern for SQLite LIKE.
 func likePattern(kw string) (string, bool) {
 	if !strings.ContainsAny(kw, `%_\`) {
 		return "%" + kw + "%", false
@@ -231,20 +231,38 @@ func likePattern(kw string) (string, bool) {
 // (spec admin-console / 跨会话搜索). Reads do not block sends, so a call no
 // longer needs a scan cap.
 func (s *sqlStore) SearchMessages(f SearchFilter, from SearchCursor) (SearchResult, error) {
+	return s.SearchMessagesContext(context.Background(), f, from)
+}
+
+func (s *sqlStore) SearchMessagesContext(ctx context.Context, f SearchFilter, from SearchCursor) (SearchResult, error) {
 	limit := f.Limit
 	if limit <= 0 || limit > SearchMaxResults {
 		limit = SearchMaxResults
 	}
 	where := []string{"deleted = 0"}
 	var args []any
-	if kw := strings.TrimSpace(f.Keyword); kw != "" {
+	var trigrams []string
+	for _, term := range append([]string{f.Keyword}, f.Keywords...) {
+		kw := strings.TrimSpace(term)
+		if kw == "" {
+			continue
+		}
 		pat, esc := likePattern(kw)
-		clause := `pk IN (SELECT rowid FROM messages_fts WHERE body LIKE ?`
+		clause := `body LIKE ?`
 		if esc {
 			clause += ` ESCAPE '\'`
 		}
-		where = append(where, clause+`)`)
+		where = append(where, clause)
 		args = append(args, pat)
+		if utf8.RuneCountInString(kw) >= 3 && !strings.ContainsRune(kw, '\x00') {
+			trigrams = append(trigrams, `"`+strings.ReplaceAll(kw, `"`, `""`)+`"`)
+		}
+	}
+	// Use one indexed intersection for general searches. Structured filters use
+	// their own message indexes and apply literal predicates to those rows.
+	if len(trigrams) > 0 && f.AuthorID == "" && f.ConversationID == "" {
+		where = append(where, "pk IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH ?)")
+		args = append(args, strings.Join(trigrams, " AND "))
 	}
 	if f.AuthorID != "" {
 		where, args = append(where, "author_id = ?"), append(args, f.AuthorID)
@@ -263,7 +281,7 @@ func (s *sqlStore) SearchMessages(f SearchFilter, from SearchCursor) (SearchResu
 		args = append(args, from.At, from.At, from.ID)
 	}
 	args = append(args, limit+1)
-	list, err := collectMessages(s.db.Query(`SELECT `+msgCols+` FROM messages WHERE `+
+	list, err := collectMessages(s.db.QueryContext(ctx, `SELECT `+msgCols+` FROM messages WHERE `+
 		strings.Join(where, " AND ")+` ORDER BY created_at DESC, id DESC LIMIT ?`, args...))
 	if err != nil {
 		return SearchResult{}, err
@@ -410,7 +428,9 @@ func (s *sqlStore) ListAudit(f AuditFilter) ([]AuditEntry, error) {
 	}
 	where := []string{"1 = 1"}
 	var args []any
-	if f.Before > 0 {
+	if f.BeforeID > 0 {
+		where, args = append(where, "(at, id) < (?, ?)"), append(args, f.Before, f.BeforeID)
+	} else if f.Before > 0 {
 		where, args = append(where, "at < ?"), append(args, f.Before)
 	}
 	if f.ActorID != "" {
@@ -426,7 +446,7 @@ func (s *sqlStore) ListAudit(f AuditFilter) ([]AuditEntry, error) {
 		where, args = append(where, "at <= ?"), append(args, f.To)
 	}
 	args = append(args, limit)
-	rows, err := s.db.Query(`SELECT at, actor_id, actor_name, action, target, detail FROM audit WHERE `+
+	rows, err := s.db.Query(`SELECT id, at, actor_id, actor_name, action, target, detail FROM audit WHERE `+
 		strings.Join(where, " AND ")+` ORDER BY at DESC, id DESC LIMIT ?`, args...)
 	if err != nil {
 		return nil, mapErr(err)
@@ -436,7 +456,7 @@ func (s *sqlStore) ListAudit(f AuditFilter) ([]AuditEntry, error) {
 	for rows.Next() {
 		var e AuditEntry
 		var detail string
-		if err := rows.Scan(&e.At, &e.ActorID, &e.ActorName, &e.Action, &e.Target, &detail); err != nil {
+		if err := rows.Scan(&e.ID, &e.At, &e.ActorID, &e.ActorName, &e.Action, &e.Target, &detail); err != nil {
 			return nil, mapErr(err)
 		}
 		if detail != "" {

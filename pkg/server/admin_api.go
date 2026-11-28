@@ -1,6 +1,8 @@
 package server
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"sort"
@@ -168,8 +170,11 @@ func (s *Server) apiUsers(w http.ResponseWriter, r *http.Request, a adminSession
 	search := strings.ToLower(strings.TrimSpace(query.Get("q")))
 	var users []storage.User
 	var next string
+	var page, last int64
 	var err error
-	if query.Has("limit") || query.Has("after") {
+	if query.Has("page") {
+		users, page, last, err = s.st.ListUserDirectory(r.Context(), search, queryInt(query.Get("page")), pageLimit(r, 50, 100))
+	} else if query.Has("limit") || query.Has("after") {
 		limit := queryInt(query.Get("limit"))
 		if limit <= 0 {
 			limit = 50
@@ -180,7 +185,9 @@ func (s *Server) apiUsers(w http.ResponseWriter, r *http.Request, a adminSession
 		users, err = s.st.ListUsers()
 	}
 	if err != nil {
-		s.writeStorageErr(w, err)
+		if r.Context().Err() == nil {
+			s.writeStorageErr(w, err)
+		}
 		return
 	}
 	names := map[string]string{}
@@ -196,7 +203,7 @@ func (s *Server) apiUsers(w http.ResponseWriter, r *http.Request, a adminSession
 		}
 		out = append(out, s.userRow(u, online[u.ID], names, now))
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"users": out, "next": next})
+	writeJSON(w, http.StatusOK, map[string]any{"users": out, "next": next, "page": page, "last": last})
 }
 
 func (s *Server) apiUser(w http.ResponseWriter, r *http.Request, a adminSession) {
@@ -389,6 +396,39 @@ func (s *Server) apiSetPerms(w http.ResponseWriter, r *http.Request, a adminSess
 }
 
 func (s *Server) apiAccounts(w http.ResponseWriter, r *http.Request, a adminSession) {
+	q := r.URL.Query()
+	if q.Has("limit") || q.Has("after") || q.Has("q") || q.Has("page") {
+		var users []storage.User
+		var next string
+		var page, last int64
+		var err error
+		search, limit := strings.ToLower(strings.TrimSpace(q.Get("q"))), pageLimit(r, 50, 100)
+		if q.Has("page") {
+			users, page, last, err = s.st.ListUserDirectory(r.Context(), search, queryInt(q.Get("page")), limit)
+		} else {
+			users, next, err = s.st.ListUsersPage(search, q.Get("after"), limit)
+		}
+		if err != nil {
+			if r.Context().Err() == nil {
+				s.writeStorageErr(w, err)
+			}
+			return
+		}
+		type accountRow struct {
+			ID       string   `json:"id"`
+			Username string   `json:"username"`
+			Perms    []string `json:"perms"`
+			Super    bool     `json:"super"`
+			Admin    bool     `json:"admin"`
+		}
+		out := make([]accountRow, 0, len(users))
+		for _, u := range users {
+			perms := permList(effectivePerms(u))
+			out = append(out, accountRow{u.ID, u.Username, perms, u.Super, len(perms) != 0})
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"users": out, "next": next, "page": page, "last": last})
+		return
+	}
 	users, err := s.st.ListUsers()
 	if err != nil {
 		s.writeStorageErr(w, err)
@@ -482,12 +522,13 @@ type auditRes struct {
 func (s *Server) apiAudit(w http.ResponseWriter, r *http.Request, a adminSession) {
 	q := r.URL.Query()
 	f := storage.AuditFilter{
-		ActorID: q.Get("actor"),
-		Action:  q.Get("action"),
-		From:    queryInt(q.Get("from")),
-		To:      queryInt(q.Get("to")),
-		Before:  queryInt(q.Get("before")),
-		Limit:   int(queryInt(q.Get("limit"))),
+		ActorID:  q.Get("actor"),
+		Action:   q.Get("action"),
+		From:     queryInt(q.Get("from")),
+		To:       queryInt(q.Get("to")),
+		Before:   queryInt(q.Get("before")),
+		BeforeID: queryInt(q.Get("before_id")),
+		Limit:    int(queryInt(q.Get("limit"))),
 	}
 	// Filtering by name is what a person types; resolve it to the ID.
 	if name := strings.TrimSpace(q.Get("actor_name")); name != "" && f.ActorID == "" {
@@ -505,24 +546,29 @@ func (s *Server) apiAudit(w http.ResponseWriter, r *http.Request, a adminSession
 		s.writeStorageErr(w, err)
 		return
 	}
-	names := s.userNames()
 	out := make([]auditRes, 0, len(entries))
+	targets := make(map[string]string)
 	for _, e := range entries {
-		out = append(out, auditRes{AuditEntry: e, TargetName: s.auditTargetName(e, names)})
+		label, found := targets[e.Target]
+		if !found {
+			label = s.auditTargetName(e.Target)
+			targets[e.Target] = label
+		}
+		out = append(out, auditRes{AuditEntry: e, TargetName: label})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"entries": out})
 }
 
 // auditTargetName labels an entry's target for display.
-func (s *Server) auditTargetName(e storage.AuditEntry, names map[string]string) string {
-	if e.Target == "" {
+func (s *Server) auditTargetName(id string) string {
+	if id == "" {
 		return ""
 	}
-	if n, ok := names[e.Target]; ok {
-		return n
+	if u, err := s.st.UserByID(id); err == nil {
+		return u.Username
 	}
-	if cv, err := s.st.ConversationByID(e.Target); err == nil {
-		return s.conversationLabel(cv, names)
+	if cv, err := s.st.ConversationByID(id); err == nil {
+		return s.conversationLabel(cv, s.namedUsers(cv.MemberIDs))
 	}
 	return ""
 }
@@ -530,6 +576,14 @@ func (s *Server) auditTargetName(e storage.AuditEntry, names map[string]string) 
 func queryInt(v string) int64 {
 	n, _ := strconv.ParseInt(v, 10, 64)
 	return n
+}
+
+func pageLimit(r *http.Request, fallback, maxLimit int) int {
+	limit := queryInt(r.URL.Query().Get("limit"))
+	if limit <= 0 {
+		return fallback
+	}
+	return int(min(limit, int64(maxLimit)))
 }
 
 // ---------- conversations and search ----------
@@ -560,38 +614,72 @@ func (s *Server) conversationLabel(cv storage.Conversation, names map[string]str
 	return "#" + cv.Name
 }
 
+func (s *Server) namedUsers(ids []string) map[string]string {
+	names := make(map[string]string, len(ids))
+	for _, id := range ids {
+		names[id] = s.userName(id)
+	}
+	return names
+}
+
 func (s *Server) apiConversations(w http.ResponseWriter, r *http.Request, a adminSession) {
-	convs, err := s.st.ListConversations()
+	q := r.URL.Query()
+	var after storage.AdminConversationCursor
+	if cursor := q.Get("after"); cursor != "" {
+		raw, err := base64.RawURLEncoding.DecodeString(cursor)
+		if len(cursor) > 4096 || err != nil || json.Unmarshal(raw, &after) != nil || after.ID == "" {
+			writeErr(w, http.StatusBadRequest, protocol.CodeInvalidArgument)
+			return
+		}
+	}
+	limit, queryLimit := -1, -1
+	search := strings.TrimSpace(q.Get("q"))
+	var page, last, offset int64
+	if q.Has("page") {
+		limit = pageLimit(r, 40, 100)
+		count, err := s.st.CountAdminConversations(r.Context(), search)
+		if err != nil {
+			if r.Context().Err() == nil {
+				s.writeStorageErr(w, err)
+			}
+			return
+		}
+		last = max(1, (count+int64(limit)-1)/int64(limit))
+		page = min(last, max(1, queryInt(q.Get("page"))))
+		offset = (page - 1) * int64(limit)
+		queryLimit = limit
+		after = storage.AdminConversationCursor{}
+	} else if q.Has("limit") || q.Has("after") || q.Has("q") {
+		limit = pageLimit(r, 40, 100)
+		queryLimit = limit + 1
+	}
+	convs, err := s.st.ListAdminConversations(r.Context(), search, after, queryLimit, offset)
 	if err != nil {
-		s.writeStorageErr(w, err)
+		if r.Context().Err() == nil {
+			s.writeStorageErr(w, err)
+		}
 		return
 	}
-	names := s.userNames()
+	next := ""
+	if limit > 0 && len(convs) > limit {
+		convs = convs[:limit]
+		last := convs[limit-1]
+		cursor, _ := json.Marshal(storage.AdminConversationCursor{LastAt: last.LastAt, Label: last.Label, ID: last.ID})
+		next = base64.RawURLEncoding.EncodeToString(cursor)
+	}
 	out := make([]adminConvRes, 0, len(convs))
 	for _, cv := range convs {
 		row := adminConvRes{
-			ID: cv.ID, Kind: cv.Kind, Label: s.conversationLabel(cv, names), Topic: cv.Topic,
-			CreatedBy: nameOr(names, cv.CreatedBy), CreatedAt: cv.CreatedAt,
-			Members: s.st.MemberCount(cv.ID),
+			ID: cv.ID, Kind: cv.Kind, Label: cv.Label, Topic: cv.Topic,
+			CreatedBy: cv.CreatedBy, CreatedAt: cv.CreatedAt, Members: cv.Members,
+			LastAt: cv.LastAt, MessageCount: cv.MessageCount,
 		}
-		if cv.Kind == protocol.KindDM {
-			for _, id := range cv.MemberIDs {
-				row.MemberNames = append(row.MemberNames, nameOr(names, id))
-			}
-		}
-		if last, _, err := s.st.MessagesBefore(cv.ID, 0, 1); err == nil && len(last) == 1 {
-			row.LastAt = last[0].CreatedAt
-			row.MessageCount = last[0].Seq
+		if cv.Kind == protocol.KindDM && cv.Label != "" {
+			row.MemberNames = strings.Split(cv.Label, " ↔ ")
 		}
 		out = append(out, row)
 	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].LastAt != out[j].LastAt {
-			return out[i].LastAt > out[j].LastAt
-		}
-		return out[i].Label < out[j].Label
-	})
-	writeJSON(w, http.StatusOK, map[string]any{"conversations": out})
+	writeJSON(w, http.StatusOK, map[string]any{"conversations": out, "next": next, "page": page, "last": last})
 }
 
 func (s *Server) apiMessages(w http.ResponseWriter, r *http.Request, a adminSession) {
@@ -614,8 +702,7 @@ func (s *Server) apiMessages(w http.ResponseWriter, r *http.Request, a adminSess
 		s.writeStorageErr(w, err)
 		return
 	}
-	names := s.userNames()
-	label := s.conversationLabel(cv, names)
+	label := s.conversationLabel(cv, s.namedUsers(cv.MemberIDs))
 	// Every look at a conversation is recorded, private or not, including each
 	// page further back (spec account-moderation / 审计日志).
 	detail := map[string]string{"kind": cv.Kind, "label": label}
@@ -628,7 +715,7 @@ func (s *Server) apiMessages(w http.ResponseWriter, r *http.Request, a adminSess
 	for _, m := range msgs {
 		pm := s.toProtocolMessage(m)
 		if pm.AuthorName == "" {
-			pm.AuthorName = nameOr(names, m.AuthorID)
+			pm.AuthorName = m.AuthorID
 		}
 		out = append(out, pm)
 	}
@@ -647,18 +734,33 @@ type searchHit struct {
 
 func (s *Server) apiSearch(w http.ResponseWriter, r *http.Request, a adminSession) {
 	q := r.URL.Query()
+	const maxTerms = 16
+	terms := make([]string, 0, len(q["keyword"]))
+	for _, raw := range q["keyword"] {
+		if term := strings.TrimSpace(raw); term != "" {
+			terms = append(terms, term)
+		}
+	}
+	if len(terms) > maxTerms {
+		writeErrMsg(w, http.StatusBadRequest, protocol.CodeInvalidArgument, "最多输入 16 个关键词")
+		return
+	}
 	f := storage.SearchFilter{
-		Keyword:        q.Get("q"),
+		Keyword:        strings.TrimSpace(q.Get("q")),
+		Keywords:       terms,
 		ConversationID: q.Get("conversation"),
 		From:           queryInt(q.Get("from")),
 		To:             queryInt(q.Get("to")),
 		Limit:          int(queryInt(q.Get("limit"))),
 	}
-	names := s.userNames()
+	highlights := terms
+	if f.Keyword != "" {
+		highlights = append([]string{f.Keyword}, terms...)
+	}
 	if author := strings.TrimSpace(q.Get("author")); author != "" {
 		u, err := s.st.UserByUsernameKey(strings.ToLower(author))
 		if err != nil {
-			writeJSON(w, http.StatusOK, map[string]any{"messages": []searchHit{}, "next": nil})
+			writeJSON(w, http.StatusOK, map[string]any{"messages": []searchHit{}, "next": nil, "keywords": highlights})
 			return
 		}
 		f.AuthorID = u.ID
@@ -672,31 +774,46 @@ func (s *Server) apiSearch(w http.ResponseWriter, r *http.Request, a adminSessio
 			detail[k] = v
 		}
 	}
+	if len(terms) > 0 {
+		encoded, _ := json.Marshal(terms)
+		detail["keywords"] = string(encoded)
+	}
 	if cur != (storage.SearchCursor{}) {
 		detail["continued"] = "true"
 	}
 	s.audit(a.actor(), "search", "", detail)
 
-	res, err := s.st.SearchMessages(f, cur)
+	res, err := s.st.SearchMessagesContext(r.Context(), f, cur)
 	if err != nil {
-		s.writeStorageErr(w, err)
+		if r.Context().Err() == nil {
+			s.writeStorageErr(w, err)
+		}
 		return
 	}
-	labels := map[string]storage.Conversation{}
+	type conversationInfo struct{ label, kind string }
+	labels := map[string]conversationInfo{}
 	out := make([]searchHit, 0, len(res.Messages))
+	users := s.newUserCache()
+	authors := make([]string, 0, len(res.Messages))
 	for _, m := range res.Messages {
-		cv, ok := labels[m.ConversationID]
-		if !ok {
-			cv, _ = s.st.ConversationByID(m.ConversationID)
-			labels[m.ConversationID] = cv
-		}
-		pm := s.toProtocolMessage(m)
-		if pm.AuthorName == "" {
-			pm.AuthorName = nameOr(names, m.AuthorID)
-		}
-		out = append(out, searchHit{Message: pm, ConversationLabel: s.conversationLabel(cv, names), ConversationKind: cv.Kind})
+		authors = append(authors, m.AuthorID)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"messages": out, "next": res.Next})
+	users.load(authors)
+	for _, m := range res.Messages {
+		info, ok := labels[m.ConversationID]
+		if !ok {
+			cv, _ := s.st.ConversationByID(m.ConversationID)
+			info = conversationInfo{s.conversationLabel(cv, s.namedUsers(cv.MemberIDs)), cv.Kind}
+			labels[m.ConversationID] = info
+		}
+		author := users.get(m.AuthorID)
+		if author.Username == "" {
+			author.Username = m.AuthorID
+		}
+		pm := messageWithAuthor(m, author.Username, author.Avatar, author.Color)
+		out = append(out, searchHit{Message: pm, ConversationLabel: info.label, ConversationKind: info.kind})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"messages": out, "next": res.Next, "keywords": highlights})
 }
 
 // ---------- error mapping ----------

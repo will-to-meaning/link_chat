@@ -145,11 +145,14 @@ func (s *Server) SetDashboardSimulation(enabled bool) {
 		return
 	}
 	s.simulation.mu.Lock()
-	defer s.simulation.mu.Unlock()
-	s.simulation.enabled.Store(enabled)
+	changed := s.simulation.enabled.Swap(enabled) != enabled
 	if !enabled {
 		s.stopSimulationLocked()
 		s.stopSimulationDeletionLocked()
+	}
+	s.simulation.mu.Unlock()
+	if changed {
+		s.adminEmit(adminEvent{Type: "simulation.setting", Required: PermAccountsManage})
 	}
 }
 
@@ -195,7 +198,7 @@ func (s *Server) apiSimulation(w http.ResponseWriter, r *http.Request, _ adminSe
 	s.simulation.mu.Unlock()
 	revision := strconv.FormatUint(s.simulation.accountsRevision.Load(), 10)
 	var users []storage.SimulationUser
-	if r.URL.Query().Get("users_revision") != revision {
+	if r.URL.Query().Get("status_only") != "1" && r.URL.Query().Get("users_revision") != revision {
 		var err error
 		users, err = s.st.SimulationUsers()
 		if err != nil {

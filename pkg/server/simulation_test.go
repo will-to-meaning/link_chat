@@ -147,10 +147,12 @@ func TestSimulationRunsNormalChatAndCleansOneAccount(t *testing.T) {
 
 func TestSimulationIsDisabledByDefault(t *testing.T) {
 	_, srv, admin, _ := adminFixture(t)
+	stream := admin.openEvents()
 	if status, _ := admin.get("/admin/api/simulation"); status != http.StatusNotFound {
 		t.Fatalf("simulation API registered by default: %d", status)
 	}
 	srv.SetDashboardSimulation(true)
+	stream.next("simulation.setting", time.Second)
 	if url, enabled := srv.DashboardSimulation(); url != "http://127.0.0.1:8100/admin/" || !enabled {
 		t.Fatalf("dashboard setting: %q enabled=%t", url, enabled)
 	}
@@ -164,6 +166,7 @@ func TestSimulationIsDisabledByDefault(t *testing.T) {
 		t.Fatalf("start after enabling: %d %+v", status, body)
 	}
 	srv.SetDashboardSimulation(false)
+	stream.next("simulation.setting", time.Second)
 	if status, _ := admin.get("/admin/api/simulation"); status != http.StatusNotFound {
 		t.Fatalf("simulation did not close without restarting: %d", status)
 	}
@@ -464,6 +467,15 @@ func TestSimulationAtTenThousandUsers(t *testing.T) {
 		t.Fatalf("large simulation listing status = %d", status)
 	} else if status, unchanged := admin.get("/admin/api/simulation?users_revision=" + data["users_revision"].(string)); status != http.StatusOK || unchanged["users"] != nil {
 		t.Fatalf("unchanged account list should be omitted on poll (status %d)", status)
+	}
+	if status, compact := admin.get("/admin/api/simulation?status_only=1"); status != http.StatusOK || compact["users"] != nil || compact["run"] == nil {
+		t.Fatalf("compact polling should return simulation status without accounts (status %d)", status)
+	}
+	if status, page := admin.get("/admin/api/conversations?limit=23"); status != http.StatusOK || len(page["conversations"].([]any)) != 23 || page["next"] == "" {
+		t.Fatalf("large conversation directory returned an unexpected page (status %d)", status)
+	}
+	if status, page := admin.get("/admin/api/accounts?limit=19"); status != http.StatusOK || len(page["users"].([]any)) != 19 || page["next"] == "" {
+		t.Fatalf("large account directory returned an unexpected page (status %d)", status)
 	}
 	if status, _ := admin.post("/admin/api/simulation/stop", struct{}{}); status != http.StatusOK {
 		t.Fatalf("stop large simulation = %d", status)
